@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -122,10 +123,36 @@ func validateDNS1123Labels(domain string) error {
 	return nil
 }
 
-// ValidateMetaAttributeName validates a header name
+// MaxMetaAttributeNameLength mirrors xds.MaxMetaAttributeNameLength. It is duplicated rather than
+// imported because the validation package must not depend on the xds conversion package.
+const MaxMetaAttributeNameLength = 1024
+
+// MaxMetaRegexLength mirrors xds.MaxMetaRegexLength: Go cannot measure the RE2 program size Envoy
+// enforces (re2.max_program_size.error_level, default 100), and Istio uses the same 1024-byte
+// pattern-length approximation in its own StringMatch validation.
+const MaxMetaRegexLength = 1024
+
+// metaAttributeNameInvalidChars mirrors the protoc-gen-validate rule on the borrowed Envoy
+// HeaderMatcher name: "^[^\x00\n\r]*$".
+var metaAttributeNameInvalidChars = regexp.MustCompile("[\x00\n\r]")
+
+// ValidateMetaAttributeName validates a MetaProtocol attribute name.
+//
+// The empty-name check stays a hard error: an empty name has never been a valid attribute and the
+// conversion cannot emit a HeaderMatcher without a name. Length and character-set checks were
+// added later (see validateMetaRouteMatch for the warning-vs-error policy on existing resources):
+// they reject names that exceed MaxMetaAttributeNameLength bytes or contain NUL/LF/CR, matching
+// the limit applied by the xds converter and Envoy's HeaderMatcher PGV rule.
 func ValidateMetaAttributeName(name string) error {
 	if name == "" {
 		return fmt.Errorf("attribute name cannot be empty")
+	}
+	if len(name) > MaxMetaAttributeNameLength {
+		return fmt.Errorf("attribute name %q is too long: %d bytes, max allowed is %d", name, len(name),
+			MaxMetaAttributeNameLength)
+	}
+	if metaAttributeNameInvalidChars.MatchString(name) {
+		return fmt.Errorf("attribute name %q contains invalid control characters (NUL, LF or CR)", name)
 	}
 	return nil
 }
@@ -363,17 +390,54 @@ func validateMetaRoute(route *metaprotocol.MetaRoute) (errs Validation) {
 	return errs
 }
 
-func validateMetaRouteMatch(match *metaprotocol.MetaRouteMatch) (errs error) {
-	if match != nil {
-		for name, attribute := range match.Attributes {
-			if attribute == nil {
-				errs = appendErrors(errs, fmt.Errorf("attribute match %v cannot be null", name))
-			}
-			errs = appendErrors(errs, ValidateMetaAttributeName(name))
-			errs = appendErrors(errs, validateStringMatchRegexp(attribute, "attributes"))
+func validateMetaRouteMatch(match *metaprotocol.MetaRouteMatch) (errs Validation) {
+	if match == nil {
+		return errs
+	}
+	// Sort names so repeated validations of the same resource report diagnostics in a stable
+	// order and table-driven tests can assert a deterministic result.
+	names := make([]string, 0, len(match.Attributes))
+	for name := range match.Attributes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		attribute := match.Attributes[name]
+		if attribute == nil {
+			// Kept a hard error: a null match value was never representable as a meaningful
+			// condition and the xds converter only tolerates it for backward compatibility.
+			errs = appendValidation(errs, fmt.Errorf("attribute match %v cannot be null", name))
 		}
+		if name == "" {
+			errs = appendValidation(errs, errors.New("attribute name cannot be empty"))
+		} else {
+			// Length/charset violations are reported as warnings rather than hard errors so that
+			// MetaRouters already stored in the cluster are not blocked from updating (for
+			// example a status or an unrelated rule). New creates get the same warning through
+			// the admission response's Warnings field; operators should fix the name because the
+			// xds converter refuses to publish an invalid attribute.
+			if err := validateMetaAttributeNameContent(name); err != nil {
+				errs = appendValidation(errs, WrapWarning(err))
+			}
+		}
+		errs = appendValidation(errs, validateStringMatchRegexp(attribute, "attributes"))
 	}
 	return errs
+}
+
+// validateMetaAttributeNameContent performs the length and character-set checks added after
+// ValidateMetaAttributeName was released with an empty-name-only check. Split out so callers can
+// turn these newer violations into warnings for pre-existing resources while keeping empty names
+// a hard rejection.
+func validateMetaAttributeNameContent(name string) error {
+	if len(name) > MaxMetaAttributeNameLength {
+		return fmt.Errorf("attribute name %q is too long: %d bytes, max allowed is %d", name, len(name),
+			MaxMetaAttributeNameLength)
+	}
+	if metaAttributeNameInvalidChars.MatchString(name) {
+		return fmt.Errorf("attribute name %q contains invalid control characters (NUL, LF or CR)", name)
+	}
+	return nil
 }
 
 // nolint: unparam
@@ -425,24 +489,36 @@ func routeName(route interface{}, routen int) string {
 	return fmt.Sprintf("#%d", routen)
 }
 
-func validateStringMatchRegexp(sm *metaprotocol.StringMatch, where string) error {
-	switch sm.GetMatchType().(type) {
-	case *metaprotocol.StringMatch_Regex:
-	default:
-		return nil
+// validateStringMatchRegexp returns a Validation so the legacy regex "*" can be reported as a
+// warning while everything that would make the xds conversion fail stays a hard error.
+func validateStringMatchRegexp(sm *metaprotocol.StringMatch, where string) Validation {
+	if _, ok := sm.GetMatchType().(*metaprotocol.StringMatch_Regex); !ok {
+		return Validation{}
 	}
 	re := sm.GetRegex()
+	// Backward compatibility: historical builds converted regex "*" into a present-match even
+	// though "*" is not valid RE2. Warn instead of rejecting so MetaRouters already relying on it
+	// keep updating; the xds converter performs the same present-match conversion.
+	if re == "*" {
+		return WrapWarning(fmt.Errorf("%q: regex %q is not valid RE2 and is treated as a present-match; "+
+			"use an empty match value instead", where, re))
+	}
 	if re == "" {
-		return fmt.Errorf("%q: regex string match should not be empty", where)
+		return WrapError(fmt.Errorf("%q: regex string match should not be empty", where))
+	}
+	// Envoy enforces re2.max_program_size.error_level (default 100) on the compiled program; the
+	// program size is always larger than the pattern length and Go cannot evaluate it, so the
+	// pattern length is used as an approximation, mirroring Istio's StringMatch validation.
+	if len(re) > MaxMetaRegexLength {
+		return WrapError(fmt.Errorf("%q: regex is too long: %d bytes, max allowed is %d", where, len(re),
+			MaxMetaRegexLength))
 	}
 
-	_, err := regexp.Compile(re)
-	if err == nil {
-		return nil
+	if _, err := regexp.Compile(re); err != nil {
+		return WrapError(fmt.Errorf("%q: %w; Aeraki uses RE2 style regex-based match (https://github.com/google/re2/wiki/Syntax)",
+			where, err))
 	}
-
-	return fmt.Errorf("%q: %w; Aeraki uses RE2 style regex-based match (https://github.com/google/re2/wiki/Syntax)",
-		where, err)
+	return Validation{}
 }
 
 func validateMetaRouteDestinations(destinations []*metaprotocol.MetaRouteDestination) (errs error) {

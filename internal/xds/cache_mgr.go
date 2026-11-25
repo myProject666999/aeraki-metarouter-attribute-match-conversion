@@ -120,7 +120,13 @@ func (c *CacheMgr) updateRouteCache() error {
 
 	serviceEntries := c.configStore.List(gvk.ServiceEntry, "")
 
-	routes := c.generateMetaRoutes(serviceEntries)
+	routes, err := c.generateMetaRoutes(serviceEntries)
+	if err != nil {
+		xdsLog.Errorf("failed to generate route cache: %v", err)
+		// Returning the error triggers a debounced retry; the previously computed snapshot stays
+		// in place, so an invalid MetaRouter can never widen an already-published route table.
+		return err
+	}
 	snapshot, err := generateSnapshot(routes)
 	if err != nil {
 		xdsLog.Errorf("failed to generate route cache: %v", err)
@@ -138,7 +144,8 @@ func (c *CacheMgr) updateRouteCache() error {
 	return nil
 }
 
-func (c *CacheMgr) generateMetaRoutes(serviceEntries []istioconfig.Config) []*metaroute.RouteConfiguration {
+func (c *CacheMgr) generateMetaRoutes(serviceEntries []istioconfig.Config) ([]*metaroute.RouteConfiguration,
+	error) {
 	var routes []*metaroute.RouteConfiguration
 
 	for i := range serviceEntries {
@@ -184,7 +191,11 @@ func (c *CacheMgr) generateMetaRoutes(serviceEntries []istioconfig.Config) []*me
 					xdsLog.Debugf("find destination rule ：%s for : %s", destinationRule.Name, config.Name)
 				}
 				if metaRouter != nil {
-					routes = append(routes, c.constructRoute(service, port, metaRouter, destinationRule))
+					route, err := c.constructRoute(service, port, metaRouter, destinationRule)
+					if err != nil {
+						return nil, fmt.Errorf("failed to construct route for service %s: %w", config.Name, err)
+					}
+					routes = append(routes, route)
 				} else {
 					xdsLog.Debugf("no meta router for : %s", config.Name)
 					routes = append(routes, c.defaultRoute(service, port, destinationRule))
@@ -192,7 +203,7 @@ func (c *CacheMgr) generateMetaRoutes(serviceEntries []istioconfig.Config) []*me
 			}
 		}
 	}
-	return routes
+	return routes, nil
 }
 
 func isMetaProtocolService(service *networking.ServiceEntry) bool {
@@ -205,14 +216,22 @@ func isMetaProtocolService(service *networking.ServiceEntry) bool {
 }
 
 func (c *CacheMgr) constructRoute(service *networking.ServiceEntry,
-	port *networking.ServicePort, metaRouter *metaprotocol.MetaRouter, dr *model.DestinationRuleWrapper) *metaroute.
-	RouteConfiguration {
+	port *networking.ServicePort, metaRouter *metaprotocol.MetaRouter, dr *model.DestinationRuleWrapper) (
+	*metaroute.RouteConfiguration, error) {
 	var routes []*metaroute.Route
 	for _, route := range metaRouter.Spec.Routes {
+		headerMatchers, err, warnings := MetaMatch2HttpHeaderMatch(route.Match)
+		if warnings != nil {
+			xdsLog.Warnf("metaRouter %s route %s attribute match warnings: %v", metaRouter.Name, route.Name, warnings)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("metaRouter %s route %s has invalid attribute match: %w", metaRouter.Name,
+				route.Name, err)
+		}
 		routes = append(routes, &metaroute.Route{
 			Name: route.Name,
 			Match: &metaroute.RouteMatch{
-				Metadata: MetaMatch2HttpHeaderMatch(route.Match),
+				Metadata: headerMatchers,
 			},
 			Route:            c.constructAction(port, route, dr),
 			RequestMutation:  c.constructMutation(route.RequestMutation),
@@ -225,7 +244,7 @@ func (c *CacheMgr) constructRoute(service *networking.ServiceEntry,
 		Name:   model.BuildMetaProtocolRouteName(service.Hosts[0], int(port.Number)),
 		Routes: routes,
 	}
-	return &metaRoute
+	return &metaRoute, nil
 }
 
 func (c *CacheMgr) constructAction(port *networking.ServicePort,

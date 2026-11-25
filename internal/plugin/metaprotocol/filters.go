@@ -102,7 +102,11 @@ func appendLocalRateLimitFilter(metaRouter *mpclient.MetaRouter,
 		lrt.TokenBucket = crd2tokenBucket(localRateLimit.TokenBucket)
 	}
 	if len(localRateLimit.Conditions) > 0 {
-		lrt.Conditions = crd2Conditions(localRateLimit.Conditions)
+		conditions, err := crd2Conditions(localRateLimit.Conditions)
+		if err != nil {
+			return nil, err
+		}
+		lrt.Conditions = conditions
 	}
 
 	config, err := anypb.New(lrt)
@@ -134,9 +138,17 @@ func appendGlobalRateLimitFilter(metaRouter *mpclient.MetaRouter,
 		})
 	}
 
+	metadata, err, warnings := xds.MetaMatch2HttpHeaderMatch(globalRateLimit.Match)
+	if warnings != nil {
+		generatorLog.Warnf("global rate limit attribute match warnings: %v", warnings)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("invalid global rate limit attribute match: %w", err)
+	}
+
 	grt := &grldpl.RateLimit{
 		Match: &metaroute.RouteMatch{
-			Metadata: xds.MetaMatch2HttpHeaderMatch(globalRateLimit.Match),
+			Metadata: metadata,
 		},
 		Domain: globalRateLimit.Domain,
 		Timeout: &duration.Duration{
@@ -168,20 +180,28 @@ func appendGlobalRateLimitFilter(metaRouter *mpclient.MetaRouter,
 	return filters, nil
 }
 
-func crd2Conditions(conditions []*userapi.LocalRateLimit_Condition) []*lrldpl.LocalRateLimitCondition {
+func crd2Conditions(conditions []*userapi.LocalRateLimit_Condition) ([]*lrldpl.LocalRateLimitCondition,
+	error) {
 	var localConditions []*lrldpl.LocalRateLimitCondition
 	for _, condition := range conditions {
 		if condition.TokenBucket != nil {
+			metadata, err, warnings := xds.MetaMatch2HttpHeaderMatch(condition.Match)
+			if warnings != nil {
+				generatorLog.Warnf("local rate limit condition attribute match warnings: %v", warnings)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("invalid local rate limit condition attribute match: %w", err)
+			}
 			tokenBucket := crd2tokenBucket(condition.TokenBucket)
 			localConditions = append(localConditions, &lrldpl.LocalRateLimitCondition{
 				TokenBucket: tokenBucket,
 				Match: &metaroute.RouteMatch{
-					Metadata: xds.MetaMatch2HttpHeaderMatch(condition.Match),
+					Metadata: metadata,
 				},
 			})
 		}
 	}
-	return localConditions
+	return localConditions, nil
 }
 
 func crd2tokenBucket(tbCrd *userapi.LocalRateLimit_TokenBucket) *commondataplane.TokenBucket {
